@@ -747,8 +747,7 @@ app.post("/api/user/update", authLimiter, validateAdmin({ body: userUpdateSchema
         }
         const previousProwlarrMode = currentConfig.prowlarrMode || user.prowlarrMode;
         const resolvedProwlarrMode =
-            prowlarrMode === "private" ||
-            (prowlarrMode === undefined && previousProwlarrMode === "private")
+            prowlarrMode === "private" || (prowlarrMode === undefined && previousProwlarrMode === "private")
                 ? "private"
                 : "shared";
 

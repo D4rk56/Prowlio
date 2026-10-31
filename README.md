@@ -157,10 +157,10 @@ Les artefacts (`.zip`, `.rar`, `.srt`, images, `sample`, `bonus`, `trailer`…) 
 
 Le modèle est volontairement **double**, et c'est essentiel pour la performance :
 
-| Usage                                                     | Instance utilisée                                                                                                       |
-| :-------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------- |
+| Usage                                                     | Instance utilisée                                                                                                             |
+| :-------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------- |
 | **Synchronisation RSS** (alimentation du cache mutualisé) | L'instance du serveur (`PROWLARR_URL` / `PROWLARR_KEY` dans `.env`) **et** les instances des utilisateurs en mode « partagé » |
-| **Recherche à la demande** (contenu non encore en cache)  | **Uniquement l'instance personnelle de l'utilisateur**                                                                  |
+| **Recherche à la demande** (contenu non encore en cache)  | **Uniquement l'instance personnelle de l'utilisateur**                                                                        |
 
 > ⚠️ **L'instance Prowlarr du serveur n'est jamais empruntée pour les recherches d'un utilisateur.** Sans clé Prowlarr personnelle, un utilisateur bénéficie exclusivement du **cache RSS mutualisé** — jamais d'une recherche faite en son nom sur l'instance du propriétaire (cela saturait l'instance et produisait des « timeout » pour tout le monde).
 

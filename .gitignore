@@ -1,6 +1,9 @@
 # Dépendances Node.js
 node_modules/
 
+# Sorties de compilation
+dist/
+
 # Logs
 npm-debug.log*
 yarn-debug.log*
