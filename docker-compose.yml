@@ -1,0 +1,100 @@
+services:
+  # Service Cloudflare WARP : fournit une IP de sortie résidentielle/edge Cloudflare
+  # permettant de contourner les blocages imposés par AllDebrid sur les IP Datacenter/VPS.
+  warp:
+    image: caomingjun/warp:latest
+    container_name: prowlio-warp
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    # Les sysctls suivants sont optionnels en mode proxy et bloqués sur certains hôtes VPS/LXC :
+    # sysctls:
+    #   - net.ipv6.conf.all.disable_ipv6=0
+    #   - net.ipv4.conf.all.src_valid_mark=1
+    environment:
+      - WARP_SLEEP=2
+    volumes:
+      - prowlio-warp:/var/lib/cloudflare-warp
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -x http://127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      default:
+        aliases:
+          - warp
+          - prowlio-warp
+
+  prowlio:
+    image: ghcr.io/d4rk56/prowlio:latest
+    build: .
+    container_name: prowlio
+    restart: unless-stopped
+    init: true
+    ports:
+      # Liaison sur localhost uniquement : l'accès externe passe par le tunnel Cloudflare
+      # (cloudflared atteint prowlio via le réseau Docker interne, pas via ce port publié).
+      # Pour exposer derrière un reverse proxy, voir docker-compose.reverse-proxy.yml.
+      - "127.0.0.1:3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      # Confiance accordée aux en-têtes X-Forwarded-* (défaut: false = sûr).
+      # Derrière Cloudflare Tunnel / Nginx, mettez TRUST_PROXY=1 pour restaurer le
+      # rate-limiting par IP client (sinon tous les clients partagent la même limite).
+      # - TRUST_PROXY=1
+      # Configuration Proxy WARP pour AllDebrid (supporte http://, https://, socks5://, socks5h://)
+      # - Mode HTTP standard (défaut avec caomingjun/warp) : http://warp:1080
+      # - Mode SOCKS5 avec DNS distant (recommandé pour éliminer les fuites/erreurs DNS) : socks5h://warp:1080
+      # - Mode SOCKS5 standard : socks5://warp:1080
+      - WARP_PROXY=http://warp:1080
+      # Clé secrète de chiffrement AES-256-GCM (auto-générée si omise)
+      # - APP_SECRET=changez_ce_secret_pour_la_production
+      # Mot de passe du tableau de bord administrateur (/admin) - Auto-généré si absent
+      # - ADMIN_PASSWORD=votre_mot_de_passe_admin_securise
+      # Synchronisation RSS d'arrière-plan Prowlarr (optionnel)
+      # - PROWLARR_URL=http://prowlarr:9696
+      # - PROWLARR_KEY=votre_cle_api_prowlarr
+    depends_on:
+      warp:
+        condition: service_healthy
+    extra_hosts:
+      # Permet de joindre Prowlarr sur la machine hôte via http://host.docker.internal:9696
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - prowlio-data:/app/data
+    networks:
+      default:
+        aliases:
+          - prowlio
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: prowlio-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --url http://prowlio:3000
+    depends_on:
+      prowlio:
+        condition: service_healthy
+
+volumes:
+  prowlio-data:
+    # Keep the existing volume name so upgrades retain the SQLite database.
+    name: cinecloud-data
+  prowlio-warp:
+    # Keep the existing volume name so upgrades retain WARP registration state.
+    name: cinecloud-warp
+
+# Pour connecter Prowlio au même réseau Docker que votre Prowlarr existant :
+# 1. Dans le service 'prowlio' ci-dessus, ajoutez :
+#      networks:
+#        - default
+#        - prowlarr_net
+# 2. Décommentez le bloc suivant :
+# networks:
+#   default:
+#   prowlarr_net:
+#     external: true
+#     name: nom_du_reseau_de_votre_prowlarr

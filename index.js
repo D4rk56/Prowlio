@@ -1,0 +1,1663 @@
+"use strict";
+
+const { validateEnv } = require("./lib/env");
+validateEnv();
+
+const express = require("express");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+const axios = require("axios");
+const rateLimit = require("express-rate-limit");
+const { secureFilePermissions } = require("./lib/crypto");
+
+const DATA_DIR = path.join(__dirname, "data");
+const ADMIN_PASS_FILE = path.join(DATA_DIR, ".admin_password");
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const MAX_ID_LENGTH = 2000;
+
+function isReasonableId(id) {
+    return typeof id === "string" && id.length > 0 && id.length <= MAX_ID_LENGTH && !/[\u0000-\u001f]/.test(id);
+}
+
+// Gestion sécurisée du mot de passe Administrateur (Suppression définitive de admin123)
+function resolveAdminPassword() {
+    const envPass = process.env.ADMIN_PASSWORD;
+    if (envPass && typeof envPass === "string" && envPass.trim() !== "" && envPass !== "admin123") {
+        if (fs.existsSync(ADMIN_PASS_FILE)) {
+            secureFilePermissions(ADMIN_PASS_FILE);
+        }
+        return envPass.trim();
+    }
+
+    if (!fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+    }
+
+    if (fs.existsSync(ADMIN_PASS_FILE)) {
+        try {
+            secureFilePermissions(ADMIN_PASS_FILE);
+            const saved = fs.readFileSync(ADMIN_PASS_FILE, "utf8").trim();
+            if (saved && saved.length >= 8 && saved !== "admin123") {
+                process.env.ADMIN_PASSWORD = saved;
+                return saved;
+            }
+        } catch (e) {}
+    }
+
+    const generated = crypto.randomBytes(16).toString("hex");
+    try {
+        fs.writeFileSync(ADMIN_PASS_FILE, generated, { mode: 0o600, encoding: "utf8" });
+        secureFilePermissions(ADMIN_PASS_FILE);
+    } catch (e) {}
+    process.env.ADMIN_PASSWORD = generated;
+    console.log(`[Security] 🔐 Mot de passe administrateur sécurisé généré : ${generated}`);
+    console.log(
+        `[Security] 💾 Sauvegardé dans data/.admin_password (définissez ADMIN_PASSWORD dans vos variables d'environnement pour personnaliser).`
+    );
+    return generated;
+}
+
+const { initConsoleInterceptors, getLogs, clearLogs, runWithUser } = require("./lib/logger");
+
+// Interception des logs console pour le terminal en direct du panneau d'administration
+initConsoleInterceptors();
+
+const {
+    loadCache,
+    createUser,
+    getUserByUuid,
+    updateUserConfig,
+    updateUserPassword,
+    deleteUser,
+    getUserStats,
+    getAllUsersAdmin,
+    getUsersProwlarrStatus,
+    adminDeleteUser,
+    getSystemSettings,
+    updateSystemSettings,
+    clearCachedTorrents,
+    clearMoviesCache,
+    getTopSearches,
+    clearSearchQueries,
+    isPseudoTaken,
+    purgeInactiveUsers
+} = require("./lib/db");
+
+const { hashPassword, verifyPassword, encryptConfig, decryptConfig } = require("./lib/crypto");
+const {
+    loginSchema,
+    usersQuerySchema,
+    userDeleteParamsSchema,
+    logsQuerySchema,
+    settingsSchema,
+    cacheClearSchema,
+    cleanupMagnetsSchema,
+    userRegisterSchema,
+    userLoginSchema,
+    userUpdateSchema,
+    userDeleteSchema,
+    userCleanupMagnetsSchema,
+    validateAdmin
+} = require("./lib/admin-schemas");
+const { handleManifest, handleCatalog, handleMeta, handleStream } = require("./lib/stremio");
+const { handleResolve } = require("./lib/resolver");
+const { startProwlarrWorker, stopProwlarrWorker } = require("./lib/prowlarr-worker");
+const { ALL_CATALOGS, checkTmdbKey } = require("./lib/helpers");
+const alldebrid = require("./lib/alldebrid");
+const { getWarpStatus, checkAllDebridKey, fetchWithWarpFallback } = alldebrid;
+const { LOGO_SVG, BACKGROUND_SVG, renderConfigPage, renderAdminPage } = require("./lib/ui");
+const { loadAnimeMapping } = require("./lib/animeMapping");
+const { assertSafeSelfHostedUrl, isForbiddenTargetUrl } = require("./lib/net-guard");
+const { normalizeSiteSettings } = require("./lib/sanitize");
+
+// Initialisation et indexation mémoire de la table communautaire Fribb anime-lists au boot
+loadAnimeMapping().catch(err => console.warn("[Server] AnimeMapping non disponible :", err.message));
+
+function getRequestProtocol(req) {
+    const forwarded = req.headers["x-forwarded-proto"];
+    if (forwarded) {
+        return (Array.isArray(forwarded) ? forwarded[0] : forwarded.split(",")[0]).trim();
+    }
+    return req.protocol || "http";
+}
+
+// En-tête navigateur par défaut pour les requêtes directes (TMDB, Cinemeta, Lumio)
+const BROWSER_UA =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+axios.defaults.headers.common["User-Agent"] = BROWSER_UA;
+
+const app = express();
+const cache = loadCache();
+
+// Fait confiance aux reverse proxies uniquement si explicitement configuré (TRUST_PROXY).
+// Par défaut false : req.ip = adresse socket réelle (non falsifiable via X-Forwarded-For).
+// Derrière Cloudflare Tunnel / Nginx, définir TRUST_PROXY=1.
+function resolveTrustProxy() {
+    const raw = (process.env.TRUST_PROXY || "").trim().toLowerCase();
+    if (raw === "" || raw === "false") return false;
+    if (raw === "true") return true;
+    const n = Number(raw);
+    return Number.isInteger(n) && n >= 0 ? n : false;
+}
+app.set("trust proxy", resolveTrustProxy());
+
+// Plafond de taille des corps de requête : les payloads users (config debrid +
+// catalogues) pèsent quelques Ko. Au-delà, express rejette avec un HTTP 413, ce qui
+// coupe les-Allow-DoS par corps géant sur /api/user/register et /api/user/update.
+const MAX_BODY_SIZE = "100kb";
+app.use(express.json({ limit: MAX_BODY_SIZE }));
+app.use(express.urlencoded({ extended: true, limit: MAX_BODY_SIZE }));
+
+// Politique d'origine unique, partagée par les routes API et les routes web.
+// Refuse par défaut toute origine tierce ; n'autorise que le même hôte, les
+// adresses de loopback, et la liste CORS_ALLOWED_ORIGINS de l'opérateur.
+function isOriginAllowed(origin, reqHost) {
+    let parsedOrigin;
+    try {
+        parsedOrigin = new URL(origin);
+    } catch (e) {
+        return false;
+    }
+    const originHost = parsedOrigin.host.toLowerCase();
+    const isSameHost = Boolean(reqHost) && originHost === String(reqHost).toLowerCase();
+    const isLocal = ["localhost", "127.0.0.1", "::1"].includes(parsedOrigin.hostname.toLowerCase());
+    const customAllowed = (process.env.CORS_ALLOWED_ORIGINS || "")
+        .split(",")
+        .map(o => o.trim().toLowerCase())
+        .filter(Boolean);
+    const isCustomAllowed = customAllowed.includes(origin.toLowerCase()) || customAllowed.includes(originHost);
+    return isSameHost || isLocal || isCustomAllowed;
+}
+
+// En-têtes de sécurité appliqués à toutes les réponses.
+// `script-src` / `style-src` conservent 'unsafe-inline' : les deux pages
+// (configuration et admin) sont rendues par lib/ui.js avec des <script> et des
+// gestionnaires onclick= en ligne. La CSP conserve néanmoins son bénéfice réel
+// sur les vecteurs d'injection : pas de chargement de script externe arbitraire
+// (script-src 'self'), ni de plugin (object-src 'none'), ni de base href injecté
+// (base-uri 'self'). Les polices Google et les affiches TMDB sont explicitement
+// autorisées ; l'iframe d'embed est restreinte à HTTPS.
+const CSP_DIRECTIVES = [
+    "default-src 'self'",
+    "base-uri 'self'",
+    "object-src 'none'",
+    "frame-ancestors 'self'",
+    "form-action 'self'",
+    "script-src 'self' 'unsafe-inline'",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com data:",
+    "img-src 'self' data: blob: https:",
+    "media-src 'self' blob: https:",
+    "connect-src 'self'",
+    "frame-src https:"
+].join("; ");
+
+app.disable("x-powered-by");
+app.use((req, res, next) => {
+    res.setHeader("Content-Security-Policy", CSP_DIRECTIVES);
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "SAMEORIGIN");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
+    next();
+});
+
+// Configuration CORS stricte et contextualisée
+app.use((req, res, next) => {
+    const pathUrl = req.path || "";
+
+    // Politique de cache :
+    //  - manifest.json et meta/ : réponses stables et sans secret de session →
+    //    Stremio peut les conserver quelques minutes. Le chemin contient l'UUID
+    //    de l'utilisateur, donc la clé de cache est déjà isolée par addon.
+    //  - stream/ et /resolve/ : URLs signées et dynamiques → jamais de cache.
+    //  - tout le reste (pages HTML, /api/*) : no-store, aucune donnée de
+    //    session dans un proxy partagé.
+    const isCacheable = pathUrl.includes("/meta/") || pathUrl === "/logo.png" || pathUrl === "/background.png";
+    if (isCacheable) {
+        res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=3600");
+    } else {
+        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+    }
+
+    // 1. Routes Stremio publiques & assets : CORS ouvert pour compatibilité Web Stremio et lecteurs externes
+    const isStremioRoute =
+        pathUrl.includes("/manifest.json") ||
+        pathUrl.includes("/catalog/") ||
+        pathUrl.includes("/meta/") ||
+        pathUrl.includes("/stream/") ||
+        pathUrl === "/logo.png" ||
+        pathUrl === "/background.png";
+
+    if (isStremioRoute) {
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Access-Control-Allow-Headers", "*");
+        res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+        if (req.method === "OPTIONS") return res.sendStatus(204);
+        return next();
+    }
+
+    // 2. Routes API & Administration : vérification stricte de l'origine
+    if (pathUrl.startsWith("/api/")) {
+        const origin = req.headers.origin;
+
+        // Requêtes directes sans en-tête Origin (navigation navigateur même domaine, curl, outils CLI)
+        if (!origin) {
+            return next();
+        }
+
+        if (isOriginAllowed(origin, req.get("host"))) {
+            res.setHeader("Access-Control-Allow-Origin", origin);
+            res.setHeader("Access-Control-Allow-Credentials", "true");
+            res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-Token, Accept");
+            res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+            if (req.method === "OPTIONS") return res.sendStatus(204);
+            return next();
+        }
+
+        // Origine tierce non autorisée : blocage strict
+        return res.status(403).json({ error: "CORS Forbidden: Origine non autorisée pour l'API." });
+    }
+
+    // 3. Autres routes (ex: /configure, /, /resolve/...)
+    // L'en-tête Access-Control-Allow-Origin n'est émis que pour une origine
+    // explicitement autorisée. Auparavant, l'Origin de la requête était
+    // renvoyé tel quel, ce qui exposait ces pages à toute origine tierce.
+    const origin = req.headers.origin;
+    if (origin && isOriginAllowed(origin, req.get("host"))) {
+        res.setHeader("Access-Control-Allow-Origin", origin);
+        res.setHeader("Vary", "Origin");
+        res.setHeader("Access-Control-Allow-Headers", "*");
+        res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    }
+    if (req.method === "OPTIONS") return res.sendStatus(204);
+    next();
+});
+
+// Limitation de débit sur les routes sensibles (Protection Force Brute) avec validation proxy assouplie
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: process.env.NODE_ENV === "test" ? 1000 : 30, // 30 requêtes par fenêtre (étendu en test)
+    standardHeaders: true,
+    legacyHeaders: false,
+    validate: { xForwardedForHeader: false, trustProxy: false },
+    message: { error: "Trop de tentatives d'authentification. Veuillez patienter 15 minutes." }
+});
+
+// Limitation de débit sur les sondes et vérifications d'APIs (Protection SSRF et abus de clés)
+const apiCheckLimiter = rateLimit({
+    windowMs: 60 * 1000, // 1 minute
+    max: 30, // 30 requêtes par minute
+    standardHeaders: true,
+    legacyHeaders: false,
+    validate: { xForwardedForHeader: false, trustProxy: false },
+    message: { error: "Trop de requêtes de vérification d'API. Veuillez patienter une minute." }
+});
+
+// Limitation de débit sur les actions de maintenance et sync admin
+const adminActionLimiter = rateLimit({
+    windowMs: 60 * 1000, // 1 minute
+    max: 30, // 30 requêtes par minute
+    standardHeaders: true,
+    legacyHeaders: false,
+    validate: { xForwardedForHeader: false, trustProxy: false },
+    message: { error: "Trop d'actions administratives rapprochées. Veuillez patienter une minute." }
+});
+
+// Limitation de débit sur le résolveur lazy pour prévenir le scraping de flux
+const resolveLimiter = rateLimit({
+    windowMs: 60 * 1000, // 1 minute
+    max: 60, // 60 requêtes par minute
+    standardHeaders: true,
+    legacyHeaders: false,
+    validate: { xForwardedForHeader: false, trustProxy: false },
+    message: { error: "Trop de résolutions de flux. Veuillez patienter une minute." }
+});
+
+// Authentification Administrateur
+const ADMIN_PASSWORD = resolveAdminPassword();
+const ADMIN_TOKEN_TTL_MS = 8 * 60 * 60 * 1000; // 8 heures, expiration glissante
+const activeAdminTokens = new Map(); // token -> expiresAt (timestamp ms)
+
+function requireAdmin(req, res, next) {
+    const token = req.headers["x-admin-token"];
+    if (!token) {
+        return res.status(401).json({ error: "Session administrateur non autorisée ou expirée." });
+    }
+    const expiresAt = activeAdminTokens.get(token);
+    if (!expiresAt) {
+        return res.status(401).json({ error: "Session administrateur non autorisée ou expirée." });
+    }
+    if (Date.now() > expiresAt) {
+        activeAdminTokens.delete(token);
+        return res.status(401).json({ error: "Session administrateur non autorisée ou expirée." });
+    }
+    // Renouvellement glissant de l'expiration à chaque requête autorisée
+    activeAdminTokens.set(token, Date.now() + ADMIN_TOKEN_TTL_MS);
+    next();
+}
+
+// Jeton de session UTILISATEUR : délivré après un login réussi (UUID + mot de passe) afin de
+// ne plus ressaisir le mot de passe à chaque enregistrement depuis /configure.
+// Portée volontairement limitée : un jeton n'autorise JAMAIS la modification des clés API ni
+// du mot de passe (voir /api/user/update), il est lié à un UUID et expire en 1 heure.
+const USER_SESSION_TTL_MS = 60 * 60 * 1000;
+const activeUserSessions = new Map(); // token -> { uuid, expiresAt }
+
+function issueUserSession(uuid) {
+    const token = crypto.randomBytes(32).toString("hex");
+    activeUserSessions.set(token, { uuid: String(uuid), expiresAt: Date.now() + USER_SESSION_TTL_MS });
+    return token;
+}
+
+/** Renvoie la session si le jeton est valide ET lié à cet UUID (expiration glissante). */
+function resolveUserSession(req, uuid) {
+    const token = req.headers["x-user-token"];
+    if (!token || !uuid) return null;
+    const session = activeUserSessions.get(token);
+    if (!session) return null;
+    if (Date.now() > session.expiresAt) {
+        activeUserSessions.delete(token);
+        return null;
+    }
+    if (session.uuid !== String(uuid).trim()) return null;
+    session.expiresAt = Date.now() + USER_SESSION_TTL_MS;
+    return session;
+}
+
+/** Révoque toutes les sessions d'un utilisateur (changement de mot de passe). */
+function revokeUserSessions(uuid) {
+    const target = String(uuid).trim();
+    let removed = 0;
+    for (const [token, session] of activeUserSessions) {
+        if (session.uuid === target) {
+            activeUserSessions.delete(token);
+            removed++;
+        }
+    }
+    return removed;
+}
+
+function purgeExpiredUserSessions() {
+    const now = Date.now();
+    let removed = 0;
+    for (const [token, session] of activeUserSessions) {
+        if (now > session.expiresAt) {
+            activeUserSessions.delete(token);
+            removed++;
+        }
+    }
+    if (removed > 0) {
+        console.log(`[User] ${removed} session(s) utilisateur expirée(s) purgée(s) du cache mémoire.`);
+    }
+}
+
+// Purge les sessions administrateur expirées et non réutilisées.
+// Sans appel périodique, chaque login admin empile une entrée jusqu'à 8 h de TTL :
+// la Map grossit alors que les tokens ne sont cleans qu'au moment de leur ré-utilisation
+// ou d'un logout explicite.
+function purgeExpiredAdminTokens() {
+    const now = Date.now();
+    let removed = 0;
+    for (const [token, expiresAt] of activeAdminTokens) {
+        if (now > expiresAt) {
+            activeAdminTokens.delete(token);
+            removed++;
+        }
+    }
+    if (removed > 0) {
+        console.log(`[Admin] ${removed} session(s) administrateur expirée(s) purgée(s) du cache mémoire.`);
+    }
+    return removed;
+}
+
+// Récupère la configuration d'un utilisateur par son UUID
+function getUserConfig(uuid) {
+    if (!uuid || uuid.length !== 36) return null;
+    const user = getUserByUuid(uuid);
+    if (!user || !user.configEncrypted) return null;
+    try {
+        return decryptConfig(user.configEncrypted);
+    } catch (e) {
+        console.error(`[App] Échec déchiffrement config ${uuid}:`, e.message);
+        return null;
+    }
+}
+
+// =============================================================================
+// 1. ENDPOINTS D'AUTHENTIFICATION & GESTION MULTI-UTILISATEURS
+// =============================================================================
+
+// Inscription / Création d'un nouvel Addon sécurisé
+app.post("/api/user/register", authLimiter, validateAdmin({ body: userRegisterSchema }), async (req, res) => {
+    try {
+        const {
+            password,
+            pseudo,
+            tmdbKey,
+            cacheMode,
+            langPref,
+            resolutions,
+            hideUnknownLanguages,
+            sortBy,
+            maxSizeGb,
+            maxStreams,
+            prowlarrUrl,
+            prowlarrKey,
+            prowlarrMode,
+            allowDownload,
+            disableCatalogs,
+            enabledCatalogs
+        } = req.body;
+
+        const VALID_PROVIDERS = ["alldebrid", "torbox", "both", "realdebrid", "debridlink", "multi"];
+        const debridProvider = VALID_PROVIDERS.includes(req.body.debridProvider)
+            ? req.body.debridProvider
+            : "alldebrid";
+        const apiKey = req.body.apiKey ? req.body.apiKey.trim() : "";
+        const torboxApiKey = req.body.torboxApiKey
+            ? req.body.torboxApiKey.trim()
+            : debridProvider === "torbox"
+              ? apiKey
+              : "";
+        const realdebridApiKey = req.body.realdebridApiKey ? req.body.realdebridApiKey.trim() : "";
+        const debridlinkApiKey = req.body.debridlinkApiKey ? req.body.debridlinkApiKey.trim() : "";
+
+        if (debridProvider === "both") {
+            if (!apiKey && !torboxApiKey) {
+                return res
+                    .status(400)
+                    .json({ error: "Au moins une clé API (AllDebrid ou Torbox) est requise pour le mode combiné." });
+            }
+        } else if (debridProvider === "multi") {
+            if (!apiKey && !torboxApiKey && !realdebridApiKey && !debridlinkApiKey) {
+                return res
+                    .status(400)
+                    .json({ error: "Au moins une clé API débrideur est requise pour le mode multi-débrideurs." });
+            }
+        } else if (debridProvider === "torbox") {
+            if (!torboxApiKey) {
+                return res.status(400).json({ error: "La clé API Torbox est requise." });
+            }
+        } else if (debridProvider === "realdebrid") {
+            if (!realdebridApiKey) {
+                return res.status(400).json({ error: "La clé API Real-Debrid est requise." });
+            }
+        } else if (debridProvider === "debridlink") {
+            if (!debridlinkApiKey) {
+                return res.status(400).json({ error: "La clé API Debrid-Link est requise." });
+            }
+        } else {
+            if (!apiKey) {
+                return res.status(400).json({ error: "La clé API AllDebrid est requise." });
+            }
+        }
+
+        if (!password || typeof password !== "string" || password.length < 4) {
+            return res
+                .status(400)
+                .json({ error: "Un mot de passe d'au moins 4 caractères est requis pour sécuriser vos réglages." });
+        }
+
+        const cleanPseudo = (pseudo && pseudo.trim()) || "";
+        if (!cleanPseudo || cleanPseudo.length < 2) {
+            return res.status(400).json({ error: "Le pseudo est obligatoire (au moins 2 caractères)." });
+        }
+        if (isPseudoTaken(cleanPseudo)) {
+            return res.status(400).json({ error: "Ce pseudo est déjà utilisé. Veuillez en choisir un autre." });
+        }
+
+        const rawProwlarrKey = (prowlarrKey && typeof prowlarrKey === "string" ? prowlarrKey.trim() : "") || "off";
+        const rawProwlarrUrl = (prowlarrUrl && typeof prowlarrUrl === "string" ? prowlarrUrl.trim() : "") || "";
+
+        let finalProwlarrUrl = "";
+        let finalProwlarrKey = "off";
+
+        if (rawProwlarrKey && rawProwlarrKey !== "off") {
+            if (!rawProwlarrUrl) {
+                return res
+                    .status(400)
+                    .json({ error: "Une URL d'instance Prowlarr est requise lorsque vous renseignez une clé API." });
+            }
+            if (isForbiddenTargetUrl(rawProwlarrUrl)) {
+                return res
+                    .status(400)
+                    .json({ error: "L'URL Prowlarr pointe vers une cible interdite (link-local / métadonnées)." });
+            }
+            const { checkProwlarrConnectivity } = require("./lib/prowlarr-worker");
+            const prowCheck = await checkProwlarrConnectivity(rawProwlarrUrl, rawProwlarrKey);
+            if (!prowCheck.success || !prowCheck.valid) {
+                return res.status(400).json({
+                    error: `Instance Prowlarr invalide ou injoignable : ${prowCheck.error || "échec de connexion"}. Veuillez corriger vos identifiants ou laisser la clé Prowlarr vide.`
+                });
+            }
+            finalProwlarrUrl = prowCheck.suggestedUrl || rawProwlarrUrl;
+            finalProwlarrKey = rawProwlarrKey;
+        }
+
+        const uuid = crypto.randomUUID();
+        const passwordHash = hashPassword(password);
+        const resolvedProwlarrMode = prowlarrMode === "private" ? "private" : "shared";
+
+        const configData = {
+            debridProvider,
+            apiKey: apiKey || "",
+            torboxApiKey: torboxApiKey || "",
+            realdebridApiKey: realdebridApiKey || "",
+            debridlinkApiKey: debridlinkApiKey || "",
+            pseudo: cleanPseudo,
+            tmdbKey: (tmdbKey && tmdbKey.trim()) || "default",
+            cacheMode: cacheMode === "off" ? "off" : "on",
+            langPref: langPref || "multi_vff,vff,vfi,multi,vf,vostfr",
+            resolutions: resolutions || "4k,1080p,720p,480p",
+            hideUnknownLanguages: Boolean(hideUnknownLanguages),
+            sortBy: sortBy === "size" || sortBy === "size_asc" ? sortBy : "quality",
+            maxSizeGb: maxSizeGb !== undefined && maxSizeGb !== null && maxSizeGb !== "" ? Number(maxSizeGb) : 150,
+            maxStreams: Number(maxStreams) || 0,
+            prioritizeCloud: Boolean(req.body.prioritizeCloud),
+            prowlarrUrl: finalProwlarrUrl,
+            prowlarrKey: finalProwlarrKey,
+            prowlarrMode: resolvedProwlarrMode,
+            jackettUrl: (req.body.jackettUrl && req.body.jackettUrl.trim()) || "",
+            jackettKey: (req.body.jackettKey && req.body.jackettKey.trim()) || "",
+            allowDownload: Boolean(allowDownload),
+            preValidateCache: req.body.preValidateCache !== undefined ? Boolean(req.body.preValidateCache) : true,
+            disableCatalogs: Boolean(disableCatalogs),
+            lumioUrl: (req.body.lumioUrl && req.body.lumioUrl.trim()) || "",
+            torrentioUrl: (req.body.torrentioUrl && req.body.torrentioUrl.trim()) || "",
+            enabledCatalogs: Array.isArray(enabledCatalogs)
+                ? enabledCatalogs
+                : enabledCatalogs
+                  ? enabledCatalogs.split(",")
+                  : ALL_CATALOGS.map(c => c.id)
+        };
+
+        const configEncrypted = encryptConfig(configData);
+        createUser(uuid, passwordHash, configEncrypted, configData.pseudo, configData.prowlarrMode);
+
+        const protocol = getRequestProtocol(req);
+        const host = req.get("host");
+        const manifestUrl = `${protocol}://${host}/${uuid}/manifest.json`;
+        const stremioUrl = `stremio://${host}/${uuid}/manifest.json`;
+
+        // Réveil / redémarrage du worker Prowlarr avec les nouveaux paramètres
+        stopProwlarrWorker();
+        startProwlarrWorker();
+
+        return runWithUser({ uuid, pseudo: configData.pseudo || "Utilisateur" }, () => {
+            console.log(
+                `[User] Nouveau manifest créé avec succès : UUID ${uuid}${configData.pseudo ? ` (${configData.pseudo})` : ""} [Provider: ${configData.debridProvider}, Prowlarr: ${configData.prowlarrMode}]`
+            );
+            return res.json({
+                success: true,
+                uuid,
+                manifestUrl,
+                stremioUrl
+            });
+        });
+    } catch (err) {
+        console.error("[User] Erreur lors de l'enregistrement :", err.message);
+        return res.status(500).json({ error: "Erreur serveur lors de la création du manifest." });
+    }
+});
+
+// Connexion / Récupération des réglages existants
+app.post("/api/user/login", authLimiter, validateAdmin({ body: userLoginSchema }), (req, res) => {
+    try {
+        const { uuid, password } = req.body;
+        if (!uuid || !password) {
+            return res.status(400).json({ error: "UUID et mot de passe requis." });
+        }
+
+        const user = getUserByUuid(uuid.trim());
+        if (!user || !verifyPassword(password, user.passwordHash)) {
+            return res.status(401).json({ error: "UUID ou mot de passe incorrect." });
+        }
+
+        const config = decryptConfig(user.configEncrypted);
+        const protocol = getRequestProtocol(req);
+        const host = req.get("host");
+        const manifestUrl = `${protocol}://${host}/${user.uuid}/manifest.json`;
+        const stremioUrl = `stremio://${host}/${user.uuid}/manifest.json`;
+
+        return res.json({
+            success: true,
+            uuid: user.uuid,
+            manifestUrl,
+            stremioUrl,
+            // Jeton de session : permet d'enregistrer les réglages non sensibles sans
+            // ressaisir le mot de passe (1 h, lié à cet UUID).
+            sessionToken: issueUserSession(user.uuid),
+            config: {
+                debridProvider: config.debridProvider || "alldebrid",
+                apiKeyPreview: config.apiKey ? `${config.apiKey.slice(0, 4)}...${config.apiKey.slice(-4)}` : "",
+                torboxApiKeyPreview: config.torboxApiKey
+                    ? `${config.torboxApiKey.slice(0, 4)}...${config.torboxApiKey.slice(-4)}`
+                    : "",
+                realdebridApiKeyPreview: config.realdebridApiKey
+                    ? `${config.realdebridApiKey.slice(0, 4)}...${config.realdebridApiKey.slice(-4)}`
+                    : "",
+                debridlinkApiKeyPreview: config.debridlinkApiKey
+                    ? `${config.debridlinkApiKey.slice(0, 4)}...${config.debridlinkApiKey.slice(-4)}`
+                    : "",
+                jackettUrl: config.jackettUrl || "",
+                jackettKey: config.jackettKey
+                    ? `${config.jackettKey.slice(0, 4)}...${config.jackettKey.slice(-4)}`
+                    : "",
+                pseudo: user.pseudo || config.pseudo || "",
+                tmdbKey: config.tmdbKey || "default",
+                cacheMode: config.cacheMode || "on",
+                langPref: config.langPref || "multi_vff,vff,vfi,multi,vf,vostfr",
+                resolutions: config.resolutions || "4k,1080p,720p,480p",
+                hideUnknownLanguages: Boolean(config.hideUnknownLanguages),
+                sortBy: config.sortBy || "quality",
+                maxSizeGb: config.maxSizeGb !== undefined ? config.maxSizeGb : 150,
+                maxStreams: config.maxStreams || 0,
+                prioritizeCloud: Boolean(config.prioritizeCloud),
+                prowlarrUrl: config.prowlarrUrl || "http://prowlarr:9696",
+                prowlarrKey: config.prowlarrKey || "",
+                prowlarrMode:
+                    user.prowlarrMode === "private" || config.prowlarrMode === "private" ? "private" : "shared",
+                allowDownload: Boolean(config.allowDownload),
+                preValidateCache: config.preValidateCache !== false,
+                disableCatalogs: Boolean(config.disableCatalogs),
+                lumioUrl: config.lumioUrl || "",
+                torrentioUrl: config.torrentioUrl || "",
+                enabledCatalogs: config.enabledCatalogs
+            }
+        });
+    } catch (err) {
+        return res.status(500).json({ error: "Erreur lors de la vérification des identifiants." });
+    }
+});
+
+// Mise à jour de la configuration existante
+app.post("/api/user/update", authLimiter, validateAdmin({ body: userUpdateSchema }), async (req, res) => {
+    try {
+        const {
+            uuid,
+            password,
+            pseudo,
+            debridProvider,
+            apiKey,
+            torboxApiKey,
+            newPassword,
+            tmdbKey,
+            cacheMode,
+            langPref,
+            resolutions,
+            hideUnknownLanguages,
+            sortBy,
+            maxSizeGb,
+            maxStreams,
+            prowlarrUrl,
+            prowlarrKey,
+            prowlarrMode,
+            allowDownload,
+            disableCatalogs,
+            enabledCatalogs
+        } = req.body;
+
+        if (!uuid) {
+            return res.status(400).json({ error: "UUID et mot de passe (ou jeton de session) requis." });
+        }
+
+        const user = getUserByUuid(uuid.trim());
+        if (!user) {
+            return res.status(401).json({ error: "UUID ou mot de passe incorrect." });
+        }
+
+        // Deux voies d'authentification :
+        //  - le mot de passe (complet) ;
+        //  - un jeton de session délivré par /api/user/login (réglages NON sensibles uniquement).
+        const passwordOk = Boolean(password) && verifyPassword(password, user.passwordHash);
+        const session = passwordOk ? null : resolveUserSession(req, uuid);
+        if (!passwordOk && !session) {
+            return res.status(401).json({ error: "UUID ou mot de passe incorrect." });
+        }
+
+        const currentConfig = decryptConfig(user.configEncrypted);
+
+        // Une session ne peut jamais modifier les clés API ni le mot de passe : le mot de passe
+        // reste exigé dès que ces champs changent.
+        if (session) {
+            // Un champ vide signifie « conserver la valeur enregistrée » (le formulaire affiche
+            // un aperçu masqué) : ce n'est donc pas un changement, et cela ne doit pas exiger
+            // le mot de passe — sinon enregistrer après un rechargement serait impossible.
+            const changed = (submitted, current) => {
+                const value = submitted === undefined ? "" : String(submitted).trim();
+                if (value === "") return false;
+                return value !== String(current || "");
+            };
+            const sensitiveChange =
+                changed(apiKey, currentConfig.apiKey) ||
+                changed(torboxApiKey, currentConfig.torboxApiKey) ||
+                changed(req.body.realdebridApiKey, currentConfig.realdebridApiKey) ||
+                changed(req.body.debridlinkApiKey, currentConfig.debridlinkApiKey) ||
+                changed(prowlarrKey, currentConfig.prowlarrKey) ||
+                changed(req.body.jackettKey, currentConfig.jackettKey) ||
+                changed(tmdbKey, currentConfig.tmdbKey) ||
+                Boolean(newPassword && String(newPassword).trim());
+            if (sensitiveChange) {
+                return res.status(401).json({
+                    error: "Mot de passe requis pour modifier les clés API ou le mot de passe."
+                });
+            }
+        }
+        const previousProwlarrMode = currentConfig.prowlarrMode || user.prowlarrMode;
+        const resolvedProwlarrMode =
+            prowlarrMode === "private" ||
+            (prowlarrMode === undefined && previousProwlarrMode === "private")
+                ? "private"
+                : "shared";
+
+        const VALID_PROVIDERS = ["alldebrid", "torbox", "both", "realdebrid", "debridlink", "multi"];
+        const resolvedDebridProvider =
+            debridProvider !== undefined && VALID_PROVIDERS.includes(debridProvider)
+                ? debridProvider
+                : currentConfig.debridProvider || "alldebrid";
+
+        if (pseudo !== undefined) {
+            const cleanPseudo = pseudo.trim();
+            if (cleanPseudo.length < 2) {
+                return res.status(400).json({ error: "Le pseudo doit comporter au moins 2 caractères." });
+            }
+            if (isPseudoTaken(cleanPseudo, uuid.trim())) {
+                return res.status(400).json({ error: "Ce pseudo est déjà utilisé par un autre compte." });
+            }
+        }
+
+        let nextProwlarrKey = currentConfig.prowlarrKey || "off";
+        if (prowlarrKey !== undefined && typeof prowlarrKey === "string") {
+            const trimmedKey = prowlarrKey.trim();
+            if (trimmedKey === "off") {
+                nextProwlarrKey = "off";
+            } else if (trimmedKey !== "") {
+                nextProwlarrKey = trimmedKey;
+            }
+        }
+
+        let nextProwlarrUrl = currentConfig.prowlarrUrl || "";
+        if (prowlarrUrl !== undefined && typeof prowlarrUrl === "string") {
+            const trimmedUrl = prowlarrUrl.trim();
+            if (trimmedUrl !== "") {
+                nextProwlarrUrl = trimmedUrl;
+            }
+        }
+
+        if (nextProwlarrKey === "off") {
+            nextProwlarrUrl = "";
+        } else {
+            const prowlarrChanged =
+                nextProwlarrKey !== (currentConfig.prowlarrKey || "off") ||
+                nextProwlarrUrl !== (currentConfig.prowlarrUrl || "");
+
+            if (!nextProwlarrUrl) {
+                return res.status(400).json({ error: "Une URL d'instance Prowlarr est requise." });
+            }
+            if (isForbiddenTargetUrl(nextProwlarrUrl)) {
+                return res
+                    .status(400)
+                    .json({ error: "L'URL Prowlarr pointe vers une cible interdite (link-local / métadonnées)." });
+            }
+
+            if (prowlarrChanged) {
+                const { checkProwlarrConnectivity } = require("./lib/prowlarr-worker");
+                const prowCheck = await checkProwlarrConnectivity(nextProwlarrUrl, nextProwlarrKey);
+                if (!prowCheck.success || !prowCheck.valid) {
+                    return res.status(400).json({
+                        error: `Instance Prowlarr invalide ou injoignable : ${prowCheck.error || "échec de connexion"}. Veuillez corriger vos identifiants ou laisser la clé Prowlarr vide.`
+                    });
+                }
+                if (prowCheck.suggestedUrl) {
+                    nextProwlarrUrl = prowCheck.suggestedUrl;
+                }
+            }
+        }
+
+        const updatedConfig = {
+            debridProvider: resolvedDebridProvider,
+            apiKey: apiKey && typeof apiKey === "string" && apiKey.trim() ? apiKey.trim() : currentConfig.apiKey || "",
+            torboxApiKey:
+                torboxApiKey && typeof torboxApiKey === "string" && torboxApiKey.trim()
+                    ? torboxApiKey.trim()
+                    : currentConfig.torboxApiKey || "",
+            realdebridApiKey:
+                req.body.realdebridApiKey &&
+                typeof req.body.realdebridApiKey === "string" &&
+                req.body.realdebridApiKey.trim()
+                    ? req.body.realdebridApiKey.trim()
+                    : currentConfig.realdebridApiKey || "",
+            debridlinkApiKey:
+                req.body.debridlinkApiKey &&
+                typeof req.body.debridlinkApiKey === "string" &&
+                req.body.debridlinkApiKey.trim()
+                    ? req.body.debridlinkApiKey.trim()
+                    : currentConfig.debridlinkApiKey || "",
+            pseudo: pseudo !== undefined ? pseudo.trim() : user.pseudo || currentConfig.pseudo || "",
+            tmdbKey: tmdbKey !== undefined ? tmdbKey.trim() : currentConfig.tmdbKey,
+            cacheMode: cacheMode === "off" ? "off" : cacheMode === "on" ? "on" : currentConfig.cacheMode || "on",
+            langPref: langPref !== undefined ? langPref : currentConfig.langPref,
+            resolutions: resolutions !== undefined ? resolutions : currentConfig.resolutions || "4k,1080p,720p,480p",
+            hideUnknownLanguages:
+                hideUnknownLanguages !== undefined
+                    ? Boolean(hideUnknownLanguages)
+                    : Boolean(currentConfig.hideUnknownLanguages),
+            sortBy: sortBy !== undefined ? sortBy : currentConfig.sortBy || "quality",
+            maxSizeGb:
+                maxSizeGb !== undefined
+                    ? Number(maxSizeGb) || 0
+                    : currentConfig.maxSizeGb !== undefined
+                      ? currentConfig.maxSizeGb
+                      : 150,
+            maxStreams: maxStreams !== undefined ? Number(maxStreams) || 0 : currentConfig.maxStreams || 0,
+            prioritizeCloud:
+                req.body.prioritizeCloud !== undefined
+                    ? Boolean(req.body.prioritizeCloud)
+                    : Boolean(currentConfig.prioritizeCloud),
+            prowlarrUrl: nextProwlarrUrl,
+            prowlarrKey: nextProwlarrKey,
+            prowlarrMode: resolvedProwlarrMode,
+            allowDownload: allowDownload !== undefined ? Boolean(allowDownload) : Boolean(currentConfig.allowDownload),
+            preValidateCache:
+                req.body.preValidateCache !== undefined
+                    ? Boolean(req.body.preValidateCache)
+                    : currentConfig.preValidateCache !== false,
+            disableCatalogs:
+                disableCatalogs !== undefined ? Boolean(disableCatalogs) : Boolean(currentConfig.disableCatalogs),
+            lumioUrl:
+                req.body.lumioUrl !== undefined
+                    ? req.body.lumioUrl
+                        ? req.body.lumioUrl.trim()
+                        : ""
+                    : currentConfig.lumioUrl || "",
+            torrentioUrl:
+                req.body.torrentioUrl !== undefined
+                    ? req.body.torrentioUrl
+                        ? req.body.torrentioUrl.trim()
+                        : ""
+                    : currentConfig.torrentioUrl || "",
+            jackettUrl:
+                req.body.jackettUrl !== undefined
+                    ? req.body.jackettUrl
+                        ? req.body.jackettUrl.trim()
+                        : ""
+                    : currentConfig.jackettUrl || "",
+            jackettKey:
+                req.body.jackettKey !== undefined
+                    ? req.body.jackettKey
+                        ? req.body.jackettKey.trim()
+                        : ""
+                    : currentConfig.jackettKey || "",
+            enabledCatalogs: Array.isArray(enabledCatalogs)
+                ? enabledCatalogs
+                : enabledCatalogs
+                  ? enabledCatalogs.split(",")
+                  : currentConfig.enabledCatalogs
+        };
+
+        updateUserConfig(uuid.trim(), encryptConfig(updatedConfig), updatedConfig.pseudo, updatedConfig.prowlarrMode);
+
+        if (newPassword && typeof newPassword === "string" && newPassword.length >= 4) {
+            updateUserPassword(uuid.trim(), hashPassword(newPassword));
+            // Un changement de mot de passe invalide toutes les sessions en cours.
+            revokeUserSessions(uuid.trim());
+        }
+
+        // Réveil / redémarrage du worker Prowlarr avec les paramètres mis à jour
+        stopProwlarrWorker();
+        startProwlarrWorker();
+
+        return runWithUser({ uuid: user.uuid, pseudo: updatedConfig.pseudo || "Utilisateur" }, () => {
+            console.log(
+                `[User] Configuration mise à jour pour l'UUID ${uuid} [Provider: ${updatedConfig.debridProvider}, Prowlarr: ${updatedConfig.prowlarrMode}]`
+            );
+            return res.json({ success: true, message: "Réglages mis à jour avec succès !" });
+        });
+    } catch (err) {
+        return res.status(500).json({ error: "Erreur lors de la mise à jour des réglages." });
+    }
+});
+
+app.post("/api/check/prowlarr", apiCheckLimiter, async (req, res) => {
+    const { prowlarrUrl, prowlarrKey } = req.body;
+    const { checkProwlarrConnectivity } = require("./lib/prowlarr-worker");
+    const result = await checkProwlarrConnectivity(prowlarrUrl, prowlarrKey);
+    res.json(result);
+});
+
+app.post("/api/check/jackett", apiCheckLimiter, async (req, res) => {
+    const { jackettUrl, jackettKey } = req.body;
+    if (!jackettUrl || !jackettKey) {
+        return res.json({ success: false, valid: false, error: "URL et clé API Jackett requises" });
+    }
+    const { checkJackettConnectivity } = require("./lib/jackett");
+    const result = await checkJackettConnectivity(jackettUrl, jackettKey);
+    res.json(result);
+});
+
+app.post("/api/check/lumio", apiCheckLimiter, async (req, res) => {
+    const { lumioUrl } = req.body;
+    if (!lumioUrl || typeof lumioUrl !== "string" || !lumioUrl.trim()) {
+        return res.json({ success: false, valid: false, error: "Veuillez saisir l'URL de votre manifest Lumio" });
+    }
+
+    let raw = lumioUrl.trim();
+    if (!raw.endsWith("/manifest.json")) {
+        raw = raw.replace(/\/+$/, "") + "/manifest.json";
+    }
+
+    // Garde SSRF : autorise les services auto-hébergés mais refuse les cibles dangereuses
+    // (link-local / métadonnées cloud, non spécifiée, multicast, réservée).
+    const ssrfCheck = await assertSafeSelfHostedUrl(raw);
+    if (!ssrfCheck.ok) {
+        return res.json({ success: false, valid: false, error: `URL Lumio refusée (sécurité) : ${ssrfCheck.error}` });
+    }
+
+    try {
+        const resp = await axios.get(raw, {
+            headers: {
+                "User-Agent": BROWSER_UA,
+                Accept: "application/json"
+            },
+            timeout: 5000
+        });
+
+        if (resp.status === 200 && resp.data && resp.data.id) {
+            return res.json({
+                success: true,
+                valid: true,
+                name: resp.data.name || "Lumio",
+                version: resp.data.version || "1.0",
+                description: resp.data.description || ""
+            });
+        }
+        return res.json({
+            success: false,
+            valid: false,
+            error: "Réponse reçue mais le format de manifest Stremio est invalide"
+        });
+    } catch (err) {
+        const respDataStr = err.response?.data
+            ? typeof err.response.data === "string"
+                ? err.response.data
+                : JSON.stringify(err.response.data)
+            : "";
+        if (
+            err.response &&
+            (err.response.status === 530 ||
+                respDataStr.includes("1033") ||
+                respDataStr.includes("Cloudflare Tunnel error"))
+        ) {
+            return res.json({
+                success: false,
+                valid: false,
+                isCloudflare1033: true,
+                error: "mylumio.tv est actuellement hors-ligne (Erreur Cloudflare 1033 : Tunnel déconnecté côté Lumio). Laissez ce champ vide ou réessayez plus tard."
+            });
+        }
+        if (err.response && err.response.status === 404) {
+            return res.json({
+                success: false,
+                valid: false,
+                error: "Manifest introuvable (HTTP 404). Vérifiez l'URL de votre compte mylumio.tv."
+            });
+        }
+        return res.json({
+            success: false,
+            valid: false,
+            error: err.response
+                ? `Erreur HTTP ${err.response.status} de Lumio`
+                : err.message || "Impossible de joindre Lumio"
+        });
+    }
+});
+
+// Sondage du manifest Torrentio. L'addon n'exploite QUE les infoHash de Torrentio : la clé debrid
+// de l'utilisateur reste dans l'addon et n'est jamais transmise à Torrentio.
+app.post("/api/check/torrentio", apiCheckLimiter, async (req, res) => {
+    const { torrentioUrl } = req.body;
+    if (!torrentioUrl || typeof torrentioUrl !== "string" || !torrentioUrl.trim()) {
+        return res.json({
+            success: false,
+            valid: false,
+            error: "Veuillez saisir l'URL de votre manifest Torrentio"
+        });
+    }
+
+    let raw = torrentioUrl.trim();
+    if (!raw.endsWith("/manifest.json")) {
+        raw = raw.replace(/\/+$/, "") + "/manifest.json";
+    }
+
+    // Garde SSRF : autorise les services auto-hébergés mais refuse les cibles dangereuses
+    const ssrfCheck = await assertSafeSelfHostedUrl(raw);
+    if (!ssrfCheck.ok) {
+        return res.json({
+            success: false,
+            valid: false,
+            error: `URL Torrentio refusée (sécurité) : ${ssrfCheck.error}`
+        });
+    }
+
+    try {
+        // Repli proxy ↔ direct : Cloudflare bloque les IP datacenter (403). L'ordre des tentatives
+        // est réglable depuis l'admin (« direct » essaie l'IP du serveur en premier).
+        const resp = await fetchWithWarpFallback(
+            raw,
+            {
+                headers: {
+                    "User-Agent": BROWSER_UA,
+                    Accept: "application/json",
+                    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8"
+                },
+                timeout: 5000
+            },
+            undefined,
+            getSystemSettings().torrentioEgress || "auto"
+        );
+
+        const resources = resp.data && Array.isArray(resp.data.resources) ? resp.data.resources : [];
+        const hasStreamResource = resources.some(r => r && r.name === "stream");
+        if (resp.status === 200 && resp.data && resp.data.id && (resources.length === 0 || hasStreamResource)) {
+            return res.json({
+                success: true,
+                valid: true,
+                name: resp.data.name || "Torrentio",
+                version: resp.data.version || "1.0",
+                description: resp.data.description || ""
+            });
+        }
+        return res.json({
+            success: false,
+            valid: false,
+            error: "Réponse reçue mais le manifest Stremio est invalide (id ou ressource 'stream' manquante)"
+        });
+    } catch (err) {
+        const status = err.response && err.response.status;
+        if (status === 404) {
+            return res.json({
+                success: false,
+                valid: false,
+                error: "Manifest introuvable (HTTP 404). Vérifiez l'URL de votre manifest Torrentio."
+            });
+        }
+        const attempts = err.attemptsSummary ? ` (tentatives : ${err.attemptsSummary})` : "";
+        if (status === 403) {
+            return res.json({
+                success: false,
+                valid: false,
+                error:
+                    `Torrentio a refusé la requête (403 Cloudflare)${attempts} : les IP utilisées sont bloquées. ` +
+                    "Essayez « Direct d'abord » dans Admin → Paramètres, un proxy dédié via TORRENTIO_PROXY, " +
+                    "ou hébergez votre propre instance Torrentio et collez son URL ici."
+            });
+        }
+        return res.json({
+            success: false,
+            valid: false,
+            error: status
+                ? `Erreur HTTP ${status} de Torrentio${attempts}`
+                : `${err.message || "Impossible de joindre Torrentio"}${attempts}`
+        });
+    }
+});
+
+// Suppression de configuration / Compte utilisateur
+app.post("/api/user/delete", authLimiter, validateAdmin({ body: userDeleteSchema }), (req, res) => {
+    try {
+        const { uuid, password } = req.body;
+        if (!uuid || !password) {
+            return res.status(400).json({ error: "UUID et mot de passe requis." });
+        }
+
+        const user = getUserByUuid(uuid.trim());
+        if (!user || !verifyPassword(password, user.passwordHash)) {
+            return res.status(401).json({ error: "UUID ou mot de passe incorrect." });
+        }
+
+        deleteUser(uuid.trim());
+        console.log(`[User] Compte et configuration supprimés pour l'UUID ${uuid}`);
+        return res.json({ success: true, message: "Configuration supprimée avec succès." });
+    } catch (err) {
+        return res.status(500).json({ error: "Erreur lors de la suppression de la configuration." });
+    }
+});
+
+// Nettoyage des magnets AllDebrid bloqués pour un utilisateur
+app.post(
+    "/api/user/cleanup-magnets",
+    authLimiter,
+    validateAdmin({ body: userCleanupMagnetsSchema }),
+    async (req, res) => {
+        try {
+            const { uuid, password } = req.body;
+            if (!uuid || !password) {
+                return res.status(400).json({ error: "UUID et mot de passe requis." });
+            }
+
+            const user = getUserByUuid(uuid.trim());
+            if (!user || !verifyPassword(password, user.passwordHash)) {
+                return res.status(401).json({ error: "UUID ou mot de passe incorrect." });
+            }
+
+            const config = decryptConfig(user.configEncrypted);
+            const apiKey = config?.apiKey;
+            if (!apiKey) {
+                return res.status(400).json({ error: "Aucune clé AllDebrid configurée pour cet utilisateur." });
+            }
+
+            const result = await alldebrid.cleanupPendingMagnets(apiKey);
+            return res.json(result);
+        } catch (err) {
+            console.error("[User] Erreur cleanup-magnets :", err.message);
+            return res.status(500).json({ error: "Erreur lors du nettoyage des magnets AllDebrid." });
+        }
+    }
+);
+
+// =============================================================================
+// 2. ENDPOINTS PUBLICS DE STATUT & VÉRIFICATION
+// =============================================================================
+
+app.get("/api/status/warp", (req, res) => {
+    res.json(getWarpStatus());
+});
+
+app.post("/api/check/alldebrid", apiCheckLimiter, async (req, res) => {
+    const { apiKey } = req.body;
+    const result = await checkAllDebridKey(apiKey);
+    res.json(result);
+});
+
+app.post("/api/check/torbox", apiCheckLimiter, async (req, res) => {
+    const { apiKey } = req.body;
+    const { checkTorboxKey } = require("./lib/torbox");
+    const result = await checkTorboxKey(apiKey);
+    res.json(result);
+});
+
+app.post("/api/check/realdebrid", apiCheckLimiter, async (req, res) => {
+    const { apiKey } = req.body;
+    const { checkRealDebridKey } = require("./lib/realdebrid");
+    const result = await checkRealDebridKey(apiKey);
+    res.json(result);
+});
+
+app.post("/api/check/debridlink", apiCheckLimiter, async (req, res) => {
+    const { apiKey } = req.body;
+    const { checkDebridLinkKey } = require("./lib/debridlink");
+    const result = await checkDebridLinkKey(apiKey);
+    res.json(result);
+});
+
+app.post("/api/check/tmdb", apiCheckLimiter, async (req, res) => {
+    const { tmdbKey } = req.body;
+    const result = await checkTmdbKey(tmdbKey);
+    res.json(result);
+});
+
+// Compteurs publics minimaux : ils alimentent la page d'accueil (statRegistered /
+// statActive dans lib/ui.js). Les métriques d'infrastructure (torrents en cache,
+// instantanés, films, instances Prowlarr partagées) restent réservées à
+// /api/admin/stats, protégé par requireAdmin. Route limitée pour ne pas être
+// transformée en sonde de volumétrie.
+app.get("/api/stats", apiCheckLimiter, (req, res) => {
+    const stats = getUserStats();
+    res.json({
+        totalUsers: stats.totalUsers,
+        active24h: stats.active24h,
+        active10m: stats.active10m
+    });
+});
+
+// =============================================================================
+// 3. ENDPOINTS DU PANNEAU D'ADMINISTRATION
+// =============================================================================
+
+app.post("/api/admin/login", authLimiter, validateAdmin({ body: loginSchema }), (req, res) => {
+    const { password } = req.body;
+    let isValid = false;
+    if (typeof password === "string" && typeof ADMIN_PASSWORD === "string") {
+        const passBuf = Buffer.from(password);
+        const adminBuf = Buffer.from(ADMIN_PASSWORD);
+        if (passBuf.length === adminBuf.length) {
+            isValid = crypto.timingSafeEqual(passBuf, adminBuf);
+        }
+    }
+    if (isValid) {
+        const token = crypto.randomBytes(24).toString("hex");
+        activeAdminTokens.set(token, Date.now() + ADMIN_TOKEN_TTL_MS);
+        return res.json({ success: true, token });
+    }
+    return res.status(401).json({ error: "Mot de passe administrateur incorrect." });
+});
+
+app.post("/api/admin/logout", requireAdmin, (req, res) => {
+    const token = req.headers["x-admin-token"];
+    if (token) activeAdminTokens.delete(token);
+    res.json({ success: true });
+});
+
+app.get("/api/admin/stats", requireAdmin, (req, res) => {
+    const stats = getUserStats();
+    const warp = getWarpStatus();
+    res.json({
+        ...stats,
+        topSearches: getTopSearches(15),
+        warp,
+        nodeVersion: process.version,
+        memoryRssMb: Math.round(process.memoryUsage().rss / (1024 * 1024)),
+        uptimeSeconds: Math.round(process.uptime())
+    });
+});
+
+app.get("/api/admin/users", requireAdmin, validateAdmin({ query: usersQuerySchema }), (req, res) => {
+    const sortBy = req.query.sortBy || "newest";
+    const allUsers = getAllUsersAdmin(sortBy);
+    const users = Array.isArray(allUsers) ? allUsers : [];
+    // Le Prowlarr du serveur n'étant jamais emprunté, l'admin doit voir qui a réellement
+    // configuré son instance personnelle pour la recherche à la demande.
+    const statuses = getUsersProwlarrStatus();
+    res.json(
+        users.map(u => ({
+            ...u,
+            ...(statuses.get(u.uuid) || { prowlarrConfigured: false, prowlarrHost: "" })
+        }))
+    );
+});
+
+app.delete("/api/admin/users/:uuid", requireAdmin, validateAdmin({ params: userDeleteParamsSchema }), (req, res) => {
+    const uuid = req.params.uuid;
+    adminDeleteUser(uuid);
+    res.json({ success: true });
+});
+
+app.get("/api/admin/logs", requireAdmin, validateAdmin({ query: logsQuerySchema }), (req, res) => {
+    const { level, limit, search } = req.query;
+    res.json(getLogs({ level, limit, search }));
+});
+
+app.post("/api/admin/logs/clear", requireAdmin, (req, res) => {
+    clearLogs();
+    res.json({ success: true });
+});
+
+app.get("/api/admin/settings", requireAdmin, (req, res) => {
+    res.json(getSystemSettings());
+});
+
+app.post("/api/admin/settings", requireAdmin, validateAdmin({ body: settingsSchema }), (req, res) => {
+    // Assainissement du contenu personnalisé avant persistance (HTML, URL d'iframe, URL Discord).
+    const updated = updateSystemSettings(normalizeSiteSettings(req.body));
+    res.json({ success: true, settings: updated });
+});
+
+app.post(
+    "/api/admin/cache/clear",
+    requireAdmin,
+    adminActionLimiter,
+    validateAdmin({ body: cacheClearSchema }),
+    (req, res) => {
+        const { target } = req.body;
+        let cleared = 0;
+        if (target === "torrents" || target === "all") {
+            cleared += clearCachedTorrents();
+        }
+        if (target === "movies" || target === "all") {
+            cleared += clearMoviesCache();
+        }
+        if (target === "searches" || target === "all") {
+            cleared += clearSearchQueries();
+        }
+        res.json({ success: true, cleared });
+    }
+);
+
+// Sonde / Test de santé en direct des APIs AllDebrid et Torbox
+app.get("/api/admin/health/debrid", requireAdmin, adminActionLimiter, async (req, res) => {
+    const results = {
+        timestamp: new Date().toISOString(),
+        alldebrid: { status: "unknown", latencyMs: 0, error: null },
+        torbox: { status: "unknown", latencyMs: 0, error: null }
+    };
+
+    // 1 & 2. Sondes concurrentes AllDebrid & Torbox
+    const probeAd = (async () => {
+        const adStart = Date.now();
+        try {
+            const adRes = await axios.get("https://api.alldebrid.com/v4/user", {
+                timeout: 7000,
+                headers: { "User-Agent": "CineCloud-FR-HealthProbe/1.0" },
+                validateStatus: () => true
+            });
+            results.alldebrid.latencyMs = Date.now() - adStart;
+            results.alldebrid.status = [200, 401, 403].includes(adRes.status) ? "online" : "degraded";
+            results.alldebrid.httpCode = adRes.status;
+        } catch (err) {
+            results.alldebrid.latencyMs = Date.now() - adStart;
+            results.alldebrid.status = "offline";
+            results.alldebrid.error = err.message;
+        }
+    })();
+
+    const probeTb = (async () => {
+        const tbStart = Date.now();
+        try {
+            const tbRes = await axios.get("https://api.torbox.app/v1/api/user/me", {
+                timeout: 7000,
+                headers: { "User-Agent": "CineCloud-FR-HealthProbe/1.0" },
+                validateStatus: () => true
+            });
+            results.torbox.latencyMs = Date.now() - tbStart;
+            results.torbox.status = [200, 401, 403].includes(tbRes.status) ? "online" : "degraded";
+            results.torbox.httpCode = tbRes.status;
+        } catch (err) {
+            results.torbox.latencyMs = Date.now() - tbStart;
+            results.torbox.status = "offline";
+            results.torbox.error = err.message;
+        }
+    })();
+
+    await Promise.all([probeAd, probeTb]);
+
+    res.json(results);
+});
+
+// Téléchargement sécurisé du backup SQLite
+app.get("/api/admin/backup", requireAdmin, adminActionLimiter, (req, res) => {
+    const { SQLITE_FILE, checkpointDatabase } = require("./lib/db");
+    if (!SQLITE_FILE || !fs.existsSync(SQLITE_FILE)) {
+        return res.status(404).json({ error: "Fichier de base de données SQLite introuvable." });
+    }
+    checkpointDatabase();
+    const dateStr = new Date().toISOString().slice(0, 10);
+    res.download(SQLITE_FILE, `prowlio-backup-${dateStr}.db`, err => {
+        if (err && !res.headersSent) {
+            res.status(500).json({ error: "Erreur lors du téléchargement du backup." });
+        }
+    });
+});
+
+// Purge des torrents expirés (+30 jours) déportée dans le worker thread
+app.post("/api/admin/maintenance/purge-expired", requireAdmin, adminActionLimiter, async (req, res) => {
+    const { asyncPurgeOldCachedTorrents } = require("./lib/db");
+    const purged = await asyncPurgeOldCachedTorrents(30 * 86400);
+    res.json({ success: true, purged, message: `${purged} torrents expirés (+30j) supprimés du cache.` });
+});
+
+// Purge des utilisateurs inactifs (+30 jours)
+app.post("/api/admin/maintenance/purge-inactive-users", requireAdmin, adminActionLimiter, async (req, res) => {
+    const { count, error } = purgeInactiveUsers(30 * 86400);
+    if (error) {
+        return res.status(500).json({ error: "Erreur lors de la purge des utilisateurs inactifs : " + error });
+    }
+    res.json({
+        success: true,
+        purged: count,
+        message: `${count} utilisateur(s) inactif(s) (+30j) supprimé(s).`
+    });
+});
+
+// Optimisation SQLite (WAL checkpoint & VACUUM) déportée dans le worker thread
+app.post("/api/admin/maintenance/vacuum", requireAdmin, adminActionLimiter, async (req, res) => {
+    const { asyncOptimizeDatabase } = require("./lib/db");
+    const result = await asyncOptimizeDatabase();
+    if (result && result.success) {
+        res.json({ success: true, message: "Base de données SQLite optimisée avec succès (WAL checkpoint & VACUUM)." });
+    } else {
+        res.status(500).json({ error: (result && result.error) || "Erreur lors de l'optimisation SQLite." });
+    }
+});
+
+// Déclenchement forcé immédiat du cycle RSS Prowlarr crowdsourcing
+app.post(
+    ["/api/admin/prowlarr/sync", "/api/admin/maintenance/sync-prowlarr"],
+    requireAdmin,
+    adminActionLimiter,
+    async (req, res) => {
+        const { forceSyncProwlarrCrowdsourcing } = require("./lib/prowlarr-worker");
+        const result = await forceSyncProwlarrCrowdsourcing();
+        res.json(result);
+    }
+);
+
+// Purge globale des magnets AllDebrid bloqués
+app.post(
+    "/api/admin/cleanup-magnets",
+    requireAdmin,
+    adminActionLimiter,
+    validateAdmin({ body: cleanupMagnetsSchema }),
+    async (req, res) => {
+        try {
+            const { apiKey } = req.body || {};
+            if (apiKey) {
+                const result = await alldebrid.cleanupPendingMagnets(apiKey);
+                return res.json(result);
+            }
+
+            let totalPurged = 0;
+            const cleanedKeys = new Set();
+            const defaultKey = process.env.ALLDEBRID_API_KEY;
+            if (defaultKey) {
+                cleanedKeys.add(defaultKey);
+                const rDef = await alldebrid.cleanupPendingMagnets(defaultKey);
+                totalPurged += rDef.deletedCount || 0;
+            }
+
+            const users = getAllUsersAdmin();
+            for (const u of users) {
+                const user = getUserByUuid(u.uuid);
+                if (user && user.configEncrypted) {
+                    try {
+                        const cfg = decryptConfig(user.configEncrypted);
+                        if (cfg && cfg.apiKey && !cleanedKeys.has(cfg.apiKey)) {
+                            cleanedKeys.add(cfg.apiKey);
+                            const r = await alldebrid.cleanupPendingMagnets(cfg.apiKey);
+                            totalPurged += r.deletedCount || 0;
+                        }
+                    } catch (e) {}
+                }
+            }
+            return res.json({
+                success: true,
+                deletedCount: totalPurged,
+                message: `${totalPurged} magnet(s) bloqué(s) AllDebrid supprimé(s) au total.`
+            });
+        } catch (err) {
+            console.error("[Admin] Erreur cleanup-magnets :", err.message);
+            return res.status(500).json({ error: "Erreur lors de la purge admin des magnets AllDebrid." });
+        }
+    }
+);
+
+// =============================================================================
+// 4. ENDPOINT DE RÉSOLUTION LAZY (VALIDATION & FAILOVER INSTANTANÉ)
+// =============================================================================
+app.get("/resolve/:userRef/:imdbId/:fileRef(*)", resolveLimiter, (req, res) => {
+    const userRef = req.params.userRef;
+    const user = userRef && userRef.length === 36 && userRef.includes("-") ? getUserByUuid(userRef) : null;
+    const tag = user ? { uuid: user.uuid, pseudo: user.pseudo || "Utilisateur" } : { uuid: userRef, pseudo: "Client" };
+    return runWithUser(tag, () => handleResolve(req, res));
+});
+
+// =============================================================================
+// 5. ROUTES STREMIO SÉCURISÉES (FORMAT MODERNE /:uuid/*)
+// =============================================================================
+
+// Middleware pour contextualiser les logs Stremio avec l'identité de l'utilisateur
+app.use("/:uuid", (req, res, next) => {
+    const uuid = req.params.uuid;
+    if (uuid && uuid.length === 36 && uuid.includes("-")) {
+        const user = getUserByUuid(uuid);
+        const tag = user ? { uuid: user.uuid, pseudo: user.pseudo || "Utilisateur" } : { uuid, pseudo: "Inconnu" };
+        return runWithUser(tag, () => next());
+    }
+    next();
+});
+
+app.get("/:uuid/manifest.json", (req, res) => {
+    const config = getUserConfig(req.params.uuid);
+    if (!config) return res.status(404).json({ error: "Addon introuvable pour cet identifiant." });
+    const protocol = getRequestProtocol(req);
+    const baseUrl = `${protocol}://${req.get("host")}`;
+    res.json(handleManifest(config, baseUrl, req.params.uuid));
+});
+
+app.get("/:uuid/catalog/:type/:id.json", async (req, res) => {
+    const config = getUserConfig(req.params.uuid);
+    if (!config) return res.status(404).json({ error: "Addon introuvable." });
+    if (!isReasonableId(req.params.id)) return res.status(400).json({ error: "Identifiant invalide." });
+    try {
+        const extra = req.query && Object.keys(req.query).length > 0 ? req.query : null;
+        const result = await handleCatalog(config, req.params.type, req.params.id, cache, extra);
+        res.json(result);
+    } catch (err) {
+        console.error(`[Catalog] Erreur ${req.params.id}:`, err.stack || err.message);
+        res.json({ metas: [] });
+    }
+});
+
+app.get("/:uuid/catalog/:type/:id/:extra.json", async (req, res) => {
+    const config = getUserConfig(req.params.uuid);
+    if (!config) return res.status(404).json({ error: "Addon introuvable." });
+    if (!isReasonableId(req.params.id)) return res.status(400).json({ error: "Identifiant invalide." });
+    try {
+        const extraParam = req.params.extra;
+        const extraObj = req.query && Object.keys(req.query).length > 0 ? { extraParam, ...req.query } : extraParam;
+        const result = await handleCatalog(config, req.params.type, req.params.id, cache, extraObj);
+        res.json(result);
+    } catch (err) {
+        console.error(`[Catalog] Erreur ${req.params.id} (${req.params.extra}):`, err.stack || err.message);
+        res.json({ metas: [] });
+    }
+});
+
+app.get("/:uuid/meta/:type/:id.json", async (req, res) => {
+    const config = getUserConfig(req.params.uuid);
+    if (!config) return res.status(404).json({ error: "Addon introuvable." });
+    if (!isReasonableId(req.params.id)) return res.status(400).json({ error: "Identifiant invalide." });
+    try {
+        const result = await handleMeta(config, req.params.type, req.params.id, cache);
+        res.json(result);
+    } catch (err) {
+        console.error(`[Meta] Erreur ${req.params.id}:`, err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get("/:uuid/stream/:type/:id.json", async (req, res) => {
+    const config = getUserConfig(req.params.uuid);
+    if (!config) return res.status(404).json({ error: "Addon introuvable." });
+    if (!isReasonableId(req.params.id)) return res.status(400).json({ error: "Identifiant invalide." });
+    try {
+        const protocol = getRequestProtocol(req);
+        const baseUrl = `${protocol}://${req.get("host")}`;
+        const startedAt = Date.now();
+        const result = await handleStream(config, req.params.type, req.params.id, cache, baseUrl, req.params.uuid);
+        // Latence visible dans le journal admin : permet de la comparer au « Timeout » par addon
+        // d'AIOStreams (au-delà, l'agrégateur abandonne la requête et n'affiche aucun résultat).
+        console.log(
+            `[Stream] ${req.params.type}/${req.params.id} → ${
+                Array.isArray(result.streams) ? result.streams.length : 0
+            } flux en ${Date.now() - startedAt} ms`
+        );
+        res.json(result);
+    } catch (err) {
+        console.error(`[Stream] Erreur ${req.params.id}:`, err.message);
+        res.json({ streams: [] });
+    }
+});
+
+// =============================================================================
+// 6. RÉTRO-COMPATIBILITÉ POUR LES ANCIENNES URLS (6 PARAMÈTRES) — SUPPRIMÉE
+//    Les anciennes URL embarquaient la clé API AllDebrid en clair dans le chemin
+//    et dans les URLs de flux (k_base64url). Elles ont été retirées pour des
+//    raisons de sécurité. Les utilisateurs doivent recréer un manifest UUID via `/`.
+// =============================================================================
+
+// =============================================================================
+// 7. INTERFACE WEB & STATIQUES (STREAM-FUSION & ADMIN)
+// =============================================================================
+
+app.get("/logo.png", (req, res) => {
+    res.setHeader("Content-Type", "image/svg+xml");
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    res.send(LOGO_SVG);
+});
+
+app.get("/background.png", (req, res) => {
+    res.setHeader("Content-Type", "image/svg+xml");
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    res.send(BACKGROUND_SVG);
+});
+
+app.get("/", (req, res) => {
+    res.send(renderConfigPage("register"));
+});
+
+app.get("/configure", (req, res) => {
+    res.send(renderConfigPage("configure"));
+});
+
+app.get("/:uuid/configure", (req, res) => {
+    const uuid = UUID_RE.test(req.params.uuid) ? req.params.uuid : "";
+    res.send(renderConfigPage("configure", uuid));
+});
+
+app.get("/:uuid", (req, res, next) => {
+    if (UUID_RE.test(req.params.uuid)) {
+        return res.send(renderConfigPage("configure", req.params.uuid));
+    }
+    next();
+});
+
+app.get("/:apiKey/:tmdbKey/:cacheMode/:langPref/:prowlarrKey/:enabledCatalogs/configure", (req, res) => {
+    res.redirect("/configure");
+});
+
+app.get("/admin", (req, res) => {
+    res.send(renderAdminPage());
+});
+
+// Démarrage du worker RSS Prowlarr
+startProwlarrWorker();
+
+// Purge périodique du cache de torrents (TTL 30 jours) déportée dans le worker
+const { asyncPurgeOldCachedTorrents } = require("./lib/db");
+asyncPurgeOldCachedTorrents();
+const purgeTimer = setInterval(
+    () => {
+        asyncPurgeOldCachedTorrents();
+    },
+    24 * 60 * 60 * 1000
+);
+if (purgeTimer && purgeTimer.unref) {
+    purgeTimer.unref();
+}
+
+// Purge périodique des sessions administrateur expirées (évite la croissance
+// illimitée de activeAdminTokens sur les logins successifs).
+const adminTokenPurgeTimer = setInterval(
+    () => {
+        purgeExpiredAdminTokens();
+        purgeExpiredUserSessions();
+    },
+    15 * 60 * 1000
+);
+if (adminTokenPurgeTimer && adminTokenPurgeTimer.unref) {
+    adminTokenPurgeTimer.unref();
+}
+
+app.resolveAdminPassword = resolveAdminPassword;
+module.exports = app;
+
+if (require.main === module) {
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, () => {
+        console.log(`[Server] Addon Prowlio en écoute sur le port ${PORT}`);
+        console.log(`[Server] Interface web accessible sur http://localhost:${PORT}`);
+        console.log(`[Server] Panneau d'administration sur http://localhost:${PORT}/admin`);
+    });
+}
