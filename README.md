@@ -13,7 +13,7 @@
 - [Démarrage rapide](#-démarrage-rapide)
 - [Utilisation](#-utilisation)
 - [Prowlarr & Jackett : Recherche à la demande & Torznab](#-prowlarr--rss-partagé-et-recherche-à-la-demande)
-- [Sources externes : Torrentio](#-sources-externes--torrentio--lumio)
+- [Sources externes : Torrentio](#-sources-externes--torrentio)
 - [Utilisation derrière AIOStreams](#-utilisation-derrière-aiostreams-et-autres-agrégateurs)
 - [Panneau d'administration](#-panneau-dadministration-admin)
 - [Référence API](#-référence-api)
