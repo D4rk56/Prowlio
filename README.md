@@ -100,7 +100,6 @@
 git clone https://github.com/D4rk56/Prowlio.git
 cd Prowlio
 cp .env.example .env      # puis ajustez si besoin
-docker compose up -d
 ```
 
 Le compose fournit : le serveur, un sidecar **WARP** (contournement VPS) et un **Cloudflare Tunnel** pour l'exposition HTTPS.
@@ -108,17 +107,14 @@ Le compose fournit : le serveur, un sidecar **WARP** (contournement VPS) et un *
 L'image publiée `ghcr.io/d4rk56/prowlio:latest` est reconstruite automatiquement après chaque push validé sur `main`. Pour la récupérer et démarrer Prowlio avec cette version :
 
 ```bash
+docker login ghcr.io -u D4rk56  # si le package GHCR est privé
 docker compose pull prowlio
 docker compose up -d --no-build prowlio
 ```
 
-Le dépôt Prowlio étant privé, l'image GHCR peut également être privée. Si GitHub ne rend pas le package public, authentifiez-vous d'abord auprès de `ghcr.io` avec un compte autorisé et un jeton disposant du droit `read:packages` :
+Si l'image est privée, connectez-vous avec un compte autorisé et un jeton disposant du droit `read:packages`. Docker demande le jeton sans l'inscrire dans l'historique de commandes. Si l'image est publique, la commande `docker login` est inutile.
 
-```bash
-docker login ghcr.io -u D4rk56
-```
-
-Docker demandera le jeton sans l'inscrire dans l'historique de commandes.
+Pour récupérer une nouvelle version par la suite, relancez `docker compose pull prowlio` puis `docker compose up -d --no-build prowlio`.
 
 Le workflow vérifie les tests, le build TypeScript, ESLint et Prettier avant de publier l'image multi-architecture (amd64/arm64) sur GitHub Container Registry. Les images versionnées sont également publiées lors de la création d'un tag `v*`.
 
