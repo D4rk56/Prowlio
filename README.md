@@ -105,7 +105,22 @@ docker compose up -d
 
 Le compose fournit : le serveur, un sidecar **WARP** (contournement VPS) et un **Cloudflare Tunnel** pour l'exposition HTTPS.
 
-Pour migrer une installation Cinécloud existante, arrêtez d'abord l'ancien stack avec `docker compose down` (sans `-v`), puis démarrez Prowlio. Les volumes de données Docker conservent leurs noms historiques afin de préserver la base SQLite et l'état WARP.
+L'image publiée `ghcr.io/d4rk56/prowlio:latest` est reconstruite automatiquement après chaque push validé sur `main`. Pour la récupérer et démarrer Prowlio avec cette version :
+
+```bash
+docker compose pull prowlio
+docker compose up -d --no-build prowlio
+```
+
+Le dépôt Prowlio étant privé, l'image GHCR peut également être privée. Si GitHub ne rend pas le package public, authentifiez-vous d'abord auprès de `ghcr.io` avec un compte autorisé et un jeton disposant du droit `read:packages` :
+
+```bash
+docker login ghcr.io -u D4rk56
+```
+
+Docker demandera le jeton sans l'inscrire dans l'historique de commandes.
+
+Le workflow vérifie les tests, le build TypeScript, ESLint et Prettier avant de publier l'image multi-architecture (amd64/arm64) sur GitHub Container Registry. Les images versionnées sont également publiées lors de la création d'un tag `v*`.
 
 **Récupérer le mot de passe administrateur** (généré au premier démarrage s'il n'est pas défini) :
 
@@ -334,24 +349,19 @@ Stremio desktop/mobile exigent **HTTPS** pour une URL distante. Utilisez un tunn
 
 ```
 Prowlio/
-├── index.js                  # Serveur Express : routes addon, API utilisateur & admin
+├── src/                      # Application TypeScript (source du runtime et du build Docker)
+│   ├── config/               # Configuration et validation des variables d'environnement
+│   ├── core/                 # Cache, anime, sécurité, résolution et formatage
+│   ├── providers/            # Fournisseurs de débridage et indexeurs
+│   ├── server/               # Application Express, middlewares et routes
+│   └── types/                # Types partagés
+├── dist/                     # JavaScript compilé par npm run build (généré, non versionné)
+├── index.js                  # Point d'entrée historique conservé pour compatibilité
 ├── lib/
-│   ├── stremio.js            # Manifeste, catalogue, meta, construction des flux
-│   ├── resolver.js           # Résolution lazy (/resolve) : AllDebrid & Torbox
-│   ├── alldebrid.js          # Client AllDebrid, WARP, instant-cache, quarantaine
-│   ├── torbox.js             # Client Torbox, disponibilité, quarantaine
-│   ├── prowlarr-worker.js    # RSS, crowdsourcing, recherche à la demande (budget + disjoncteur)
-│   ├── helpers.js            # Formatage des flux, parsing titres/animés, filtrage
-│   ├── ui.js                 # Pages publiques et panneau d'administration
-│   ├── db.js                 # SQLite (node:sqlite) : utilisateurs, cache, réglages
-│   ├── net-guard.js          # Garde SSRF des requêtes sortantes
-│   ├── sanitize.js           # Assainissement du HTML d'embed (anti-XSS)
-│   ├── crypto.js             # AES-256-GCM, scrypt, permissions de fichiers
-│   ├── env.js                # Validation fail-fast des variables d'environnement
-│   ├── logger.js             # Journal circulaire exposé dans l'admin
-│   └── admin-schemas.js      # Schémas Zod (API utilisateur & admin)
-├── test/                     # node:test (addon, format des flux, sécurité)
+│   └── ...                   # Modules de compatibilité utilisés par les routes et intégrations
+├── test/                     # Tests node:test
 ├── data/                     # SQLite + secrets générés (non versionné)
+├── Dockerfile                # Image de production basée sur dist/index.js
 └── docker-compose.yml        # Serveur + WARP + Cloudflare Tunnel
 ```
 
@@ -378,20 +388,23 @@ git clone https://github.com/D4rk56/Prowlio.git
 cd Prowlio
 
 # 2. Installer les dépendances
-npm install
+npm ci
 
-# 3. Lancer les tests unitaires
+# 3. Compiler l'application TypeScript
+npm run build
+
+# 4. Lancer les tests unitaires
 npm test
 
-# 4. Vérifier le lint et le formatage (exigés par le CI)
+# 5. Vérifier le lint et le formatage (exigés par le CI)
 npm run lint
 npm run format:check     # corriger avec: npm run format
 
-# 5. Démarrer
+# 6. Démarrer
 npm start
 ```
 
-Le CI (`.github/workflows/docker-publish.yml`) exécute **les tests, ESLint (0 erreur) et `prettier --check`**, puis publie l'image multi-arch sur GHCR.
+Le CI (`.github/workflows/docker-publish.yml`) exécute les tests, le build TypeScript, ESLint et `prettier --check`, puis publie l'image multi-architecture sur GHCR. Chaque push validé sur `main` met à jour `ghcr.io/d4rk56/prowlio:latest`.
 
 Contributions : voir **[CONTRIBUTING.md](CONTRIBUTING.md)**. Historique des correctifs : **[CHANGELOG.md](CHANGELOG.md)**.
 

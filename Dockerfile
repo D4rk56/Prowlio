@@ -3,21 +3,22 @@
 # Multi-stage build léger et sécurisé basé sur Node.js 24 Alpine Linux
 # ==============================================================================
 
-# Étape 1 : Construction et compilation des dépendances natives (anitomy-js / node-gyp)
-# --platform=$BUILDPLATFORM force la compilation sur la plateforme HÔTE (natif, pas d'émulation QEMU)
-# ce qui évite les timeouts et erreurs node-gyp lors de la compilation arm64 sous QEMU.
-FROM --platform=$BUILDPLATFORM node:24-alpine AS builder
+# Étape 1 : Construction et compilation des dépendances natives (anitomy-js / node-gyp).
+# Le stage utilise la plateforme cible afin que les modules natifs correspondent à chaque architecture.
+FROM node:24-alpine AS builder
 
 WORKDIR /app
 
 # Outils de compilation C++ requis par node-gyp sur Alpine
 RUN apk add --no-cache python3 make g++ gcc
 
-# Copie des fichiers de dépendances
+# Dépendances complètes nécessaires à la compilation TypeScript.
 COPY package*.json ./
+RUN npm ci
 
-# Compilation native des dépendances de production sur la plateforme hôte
-RUN npm install --omit=dev && npm cache clean --force
+# Compilation de l'application et suppression des dépendances de développement.
+COPY . .
+RUN npm run build && npm prune --omit=dev && npm cache clean --force
 
 # Étape 2 : Image d'exécution minimale pour la production
 FROM node:24-alpine
@@ -34,9 +35,10 @@ RUN apk add --no-cache libstdc++ su-exec \
     && mkdir -p /app/data \
     && chown -R node:node /app
 
-# Copie du code source de l'application
+# Copie du code de l'application compilé et de ses fichiers d'exécution.
 COPY --chown=node:node package*.json ./
 COPY --chown=node:node . .
+COPY --chown=node:node --from=builder /app/dist ./dist
 
 # Copie des dépendances de production compilées depuis l'étape builder
 COPY --chown=node:node --from=builder /app/node_modules ./node_modules
@@ -54,4 +56,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 
 # Script d'entrée pour sécuriser les permissions et lancer l'application
 ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["node", "index.js"]
+CMD ["node", "dist/index.js"]
