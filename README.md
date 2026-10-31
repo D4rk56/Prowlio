@@ -13,7 +13,7 @@
 - [Démarrage rapide](#-démarrage-rapide)
 - [Utilisation](#-utilisation)
 - [Prowlarr & Jackett : Recherche à la demande & Torznab](#-prowlarr--rss-partagé-et-recherche-à-la-demande)
-- [Sources externes : Torrentio & Lumio](#-sources-externes--torrentio--lumio)
+- [Sources externes : Torrentio](#-sources-externes--torrentio--lumio)
 - [Utilisation derrière AIOStreams](#-utilisation-derrière-aiostreams-et-autres-agrégateurs)
 - [Panneau d'administration](#-panneau-dadministration-admin)
 - [Référence API](#-référence-api)
@@ -143,22 +143,11 @@ Exposez le port `3000` derrière votre reverse proxy **en HTTPS**, et définisse
 
 Le manifeste a la forme `https://votre-domaine/<uuid>/manifest.json`.
 
-> 🎨 **Interface** : la configuration s'affiche désormais en un **formulaire unique à sections** (Débrideur, Profil & mot de passe, Préférences, Catalogues, Sources externes) — fin de l'assistant multi-étapes.
+> 🎨 **Interface** : la configuration s'affiche désormais en un **formulaire unique à sections** (Débrideur, Profil & mot de passe, Préférences, Sources externes) — fin de l'assistant multi-étapes.
 
 ### Modifier un profil
 
 Mode **Gérer mon Profil / Manifest** → UUID + mot de passe → **Charger ma Configuration**. Vos réglages non sensibles peuvent ensuite être enregistrés sans retaper le mot de passe pendant 1 h (jeton de session). Modifier une **clé API** ou le **mot de passe** redemande explicitement le mot de passe.
-
-### Catalogues fournis
-
-| Catalogue                                       | Type         | Contenu                                   |
-| :---------------------------------------------- | :----------- | :---------------------------------------- |
-| Mes Liens Débridés ☁️ / Mes Séries Débridées 📺 | film / série | Liens débridés AllDebrid                  |
-| Mon Historique 🕒 / Mon Historique Séries 🕒    | film / série | Historique de lecture                     |
-| Mes Films Cloud ☁️ / Mes Séries Cloud 📺        | film / série | Fichiers présents dans votre cloud        |
-| Mes Animés (Séries) 🇯🇵 / (Films) 🇯🇵             | série / film | Contenus animés détectés                  |
-| Recommandations Films 🍿 / Séries 📺            | film / série | Suggestions basées sur votre bibliothèque |
-| Recommandations Animés (Séries) 🇯🇵 / (Films) 🎌 | série / film | Suggestions animés                        |
 
 Les artefacts (`.zip`, `.rar`, `.srt`, images, `sample`, `bonus`, `trailer`…) sont automatiquement exclus de l'historique et du cloud : **seuls les fichiers vidéo** sont proposés.
 
@@ -185,7 +174,7 @@ Le mode choisi (`Partagé` / `Privé`) ne conditionne que la **mise en cache com
 
 ---
 
-## 🔗 Sources externes : Torrentio & Lumio
+## 🔗 Sources externes : Torrentio
 
 ### Torrentio
 
@@ -196,10 +185,6 @@ Le mode choisi (`Partagé` / `Privé`) ne conditionne que la **mise en cache com
 - **403 Cloudflare** : les IP de datacenter sont bloquées. Le proxy **WARP** est utilisé automatiquement (repli direct), et le test affiche **chaque tentative** (`proxy:403 • direct:403`).
 - **Ordre des tentatives** réglable dans **Admin → Paramètres** (_Auto_ ou _Direct d'abord_).
 - **Si les deux chemins sont bloqués** : hébergez votre propre instance Torrentio, placez un Cloudflare Worker en façade, ou utilisez une autre instance publique — le champ accepte n'importe quelle URL de manifest.
-
-### Lumio
-
-Collez l'URL de votre manifest `mylumio.tv` pour enrichir les flux instantanés à la demande (optionnel).
 
 ---
 
